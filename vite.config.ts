@@ -18,7 +18,12 @@ export default defineConfig({
     tsConfigPaths({
       projects: ["./tsconfig.json"],
     }),
-    tanstackStart(),
+    tanstackStart({
+      // API "routes" live in src/routes/api/*.ts as server-function modules
+      // (this framework version dropped file-based REST routes). They are not
+      // UI routes, so exclude the api/ directory from the generated route tree.
+      routeFileIgnorePattern: "^api$",
+    }),
     viteReact(),
   ],
 });
