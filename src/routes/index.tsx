@@ -1,8 +1,11 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { createServerFn } from "@tanstack/react-start";
 import { readFile } from "node:fs/promises";
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
 import logoUrl from "../logo.png";
+import { claimMining } from "./api/-mining";
+import { getBalance } from "./api/-balance";
+import { requestWithdrawal } from "./api/-withdraw";
 
 // Read the business name at request time
 const getBusinessName = createServerFn({ method: "GET" }).handler(async () => {
@@ -25,9 +28,23 @@ function Dashboard() {
   const businessName = Route.useLoaderData();
 
   // Core App State
-  const [balanceSats, setBalanceSats] = useState<number>(8420.0);
+  const [balanceSats, setBalanceSats] = useState<number>(0);
   const [isMining, setIsMining] = useState<boolean>(false);
   const [activeTier, setActiveTier] = useState<"free" | "pro" | "whale">("free");
+  const [loading, setLoading] = useState<boolean>(true);
+
+  // Load initial balance from backend
+  useEffect(() => {
+    getBalance().then((data) => {
+      setBalanceSats(data.sats);
+      setActiveTier(data.tier);
+      setLoading(false);
+    }).catch(() => {
+      // Fallback to defaults if backend unreachable
+      setBalanceSats(8420);
+      setLoading(false);
+    });
+  }, []);
   
   // Streak State
   const [streakDay, setStreakDay] = useState<number>(3);
@@ -162,8 +179,26 @@ function Dashboard() {
     }, 2000);
   };
 
-  // Handle Withdrawal Request
-  const handleWithdrawal = (e: React.FormEvent) => {
+  // Handle Mining Toggle — calls backend API
+  const handleMiningToggle = useCallback(async () => {
+    if (isMining) {
+      setIsMining(false);
+    } else {
+      try {
+        const result = await claimMining();
+        setBalanceSats((prev) => prev + result.reward);
+        setIsMining(true);
+        setStreakMessage(`⛏️ +${result.reward} Sats mined! Hashrate: ${result.hashrate} TH/s`);
+        setTimeout(() => setStreakMessage(""), 4000);
+      } catch {
+        // Fallback: toggle locally if backend unreachable
+        setIsMining(true);
+      }
+    }
+  }, [isMining]);
+
+  // Handle Withdrawal — calls backend API
+  const handleWithdrawal = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
     if (balanceSats < 10000) {
       setWithdrawError("Minimum withdrawal threshold is 10,000 Satoshis.");
@@ -177,14 +212,24 @@ function Dashboard() {
     setWithdrawError("");
     setIsWithdrawing(true);
 
-    setTimeout(() => {
-      const generatedTx = "tx-hh-" + Math.random().toString(16).substr(2, 9) + "f7931a";
-      setWithdrawalTxId(generatedTx);
-      setBalanceSats(0);
-      setWithdrawalSuccess(true);
+    try {
+      const result = await requestWithdrawal({
+        data: { address: withdrawAddress, amount: balanceSats },
+      });
+
+      if (result.success) {
+        setWithdrawalTxId(result.txId);
+        setBalanceSats(0);
+        setWithdrawalSuccess(true);
+      } else {
+        setWithdrawError(result.error || "Withdrawal failed");
+      }
+    } catch {
+      setWithdrawError("Network error — please try again");
+    } finally {
       setIsWithdrawing(false);
-    }, 2000);
-  };
+    }
+  }, [balanceSats, withdrawAddress]);
 
   const resetWithdrawalScreen = () => {
     setWithdrawAddress("");
@@ -347,7 +392,7 @@ function Dashboard() {
 
             {/* Giant Harvester Power Button */}
             <button
-              onClick={() => setIsMining(!isMining)}
+              onClick={handleMiningToggle}
               className={`w-full py-5 rounded-2xl font-black uppercase text-base tracking-wider transition-all duration-300 transform active:scale-95 shadow-lg flex items-center justify-center gap-3 ${
                 isMining
                   ? "bg-[#27AE60] text-black hover:bg-[#2ecc71] shadow-[0_0_20px_rgba(39,174,96,0.3)]"
