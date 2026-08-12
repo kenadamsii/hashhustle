@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">HashHustle</string>
+    <string name="title_activity_main">HashHustle</string>
+    <string name="package_name">com.hashhustle.app</string>
+    <string name="custom_url_scheme">com.hashhustle.app</string>
+</resources>
