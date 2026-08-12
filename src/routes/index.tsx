@@ -1,8 +1,13 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute } from "@tanstack/react-router";
 import { createServerFn } from "@tanstack/react-start";
 import { readFile } from "node:fs/promises";
 import { useState, useEffect, useMemo } from "react";
 import logoUrl from "../logo.png";
+import { getBalance } from "./api/balance";
+import { miningAction } from "./api/mining";
+import { requestWithdrawal } from "./api/withdraw";
+
+type UserState = Awaited<ReturnType<typeof getBalance>>;
 
 // Read the business name at request time
 const getBusinessName = createServerFn({ method: "GET" }).handler(async () => {
@@ -24,13 +29,15 @@ export const Route = createFileRoute("/")({
 function Dashboard() {
   const businessName = Route.useLoaderData();
 
-  // Core App State
-  const [balanceSats, setBalanceSats] = useState<number>(8420.0);
+  // Core App State (authoritative values come from the backend API)
+  const [userId, setUserId] = useState<string | null>(null);
+  const [serverState, setServerState] = useState<UserState | null>(null);
+  const [balanceSats, setBalanceSats] = useState<number>(0);
   const [isMining, setIsMining] = useState<boolean>(false);
   const [activeTier, setActiveTier] = useState<"free" | "pro" | "whale">("free");
   
   // Streak State
-  const [streakDay, setStreakDay] = useState<number>(3);
+  const [streakDay, setStreakDay] = useState<number>(1);
   const [streakClaimed, setStreakClaimed] = useState<boolean>(false);
   const [streakMessage, setStreakMessage] = useState<string>("");
 
@@ -42,6 +49,7 @@ function Dashboard() {
   const [adCountdown, setAdCountdown] = useState<number>(5);
   const [activeAdReward, setActiveAdReward] = useState<number>(0);
   const [activeAdTitle, setActiveAdTitle] = useState<string>("");
+  const [activeAdMissionKey, setActiveAdMissionKey] = useState<string>("");
   const [adWatchFinished, setAdWatchFinished] = useState<boolean>(false);
 
   // Subscription Modal State
@@ -56,58 +64,90 @@ function Dashboard() {
   const [withdrawError, setWithdrawError] = useState<string>("");
   const [isWithdrawing, setIsWithdrawing] = useState<boolean>(false);
 
-  // Active Mining Ticker
+  // Hydrate the session: pick a device id (persisted in localStorage) and pull
+  // the authoritative account state from the backend.
+  useEffect(() => {
+    let cancelled = false;
+    const id =
+      typeof localStorage !== "undefined"
+        ? (localStorage.getItem("hh_user_id") ?? crypto.randomUUID())
+        : "anonymous";
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem("hh_user_id", id);
+    }
+    setUserId(id);
+    getBalance({ userId: id })
+      .then((s) => {
+        if (!cancelled) applyState(s);
+      })
+      .catch(() => {
+        /* backend offline — keep default zero state */
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** Copy a backend snapshot into all local UI state. */
+  const applyState = (s: UserState) => {
+    setServerState(s);
+    setBalanceSats(s.balanceSats);
+    setActiveTier(s.tier);
+    setStreakDay(s.streakDay);
+    setStreakClaimed(s.streakClaimed);
+    setCompletedMissions(s.missionsCompletedToday);
+    setIsMining(s.mining);
+  };
+
+  /** Live mining ticker — runs at the server-reported yield rate. */
   useEffect(() => {
     let interval: Timer | null = null;
     if (isMining) {
-      // Free hashrate: 5 TH/s -> 0.1 Sats/sec
-      // Pro hashrate: 25 TH/s -> 0.5 Sats/sec
-      // Whale hashrate: 100 TH/s -> 2.0 Sats/sec
-      const incrementPerSec = activeTier === "whale" ? 2.0 : activeTier === "pro" ? 0.5 : 0.1;
-      
+      const rate = serverState?.yieldSatsPerSec ?? 0.1;
       interval = setInterval(() => {
-        setBalanceSats((prev) => parseFloat((prev + incrementPerSec).toFixed(2)));
+        setBalanceSats((prev) => prev + rate);
       }, 1000);
     }
     return () => {
       if (interval) clearInterval(interval);
     };
-  }, [isMining, activeTier]);
+  }, [isMining, serverState?.yieldSatsPerSec]);
 
-  // Derived stats
+  // Derived stats (from the live backend state)
   const activeHashrate = useMemo(() => {
     if (!isMining) return 0;
-    if (activeTier === "whale") return 100.0;
-    if (activeTier === "pro") return 25.0;
-    return 5.0;
-  }, [isMining, activeTier]);
+    return serverState?.hashrateThs ?? 5.0;
+  }, [isMining, serverState?.hashrateThs]);
 
   const withdrawalFeeRate = useMemo(() => {
-    if (activeTier === "whale") return 0.0; // 0%
-    if (activeTier === "pro") return 0.005; // 0.5%
-    return 0.015; // 1.5%
-  }, [activeTier]);
+    return serverState?.withdrawalFeeRate ?? 0.015;
+  }, [serverState?.withdrawalFeeRate]);
 
   const currentWithdrawFee = useMemo(() => {
-    return Math.round(balanceSats * withdrawalFeeRate);
+    return Math.round(balanceSats * withdrawalFeeRate * 100) / 100;
   }, [balanceSats, withdrawalFeeRate]);
 
-  // Handle Streak Claim
-  const handleClaimStreak = () => {
-    if (streakClaimed) return;
-    const bonus = 150;
-    setBalanceSats((prev) => prev + bonus);
-    setStreakClaimed(true);
-    setStreakDay(4);
-    setStreakMessage(`🎉 Stacking Streak Bonus Claimed! +${bonus} Sats added to your balance.`);
-    setTimeout(() => setStreakMessage(""), 4000);
+  // Handle Streak Claim (server-authoritative)
+  const handleClaimStreak = async () => {
+    if (streakClaimed || !userId) return;
+    const res = await miningAction({ userId, action: "streak" });
+    if (res.ok) {
+      applyState(res.state);
+      setStreakMessage(`🎉 Stacking Streak Bonus Claimed! +${res.rewardSats} Sats added to your balance.`);
+      setTimeout(() => setStreakMessage(""), 4000);
+    } else if (res.error) {
+      setStreakMessage(res.error);
+      setTimeout(() => setStreakMessage(""), 4000);
+    }
   };
 
   // Handle Video Ad Click
-  const startAdMission = (missionId: string, title: string, reward: number) => {
-    if (completedMissions.includes(missionId)) return;
+  const startAdMission = (missionKey: string, title: string, reward: number) => {
+    if (completedMissions.includes(missionKey)) return;
     setActiveAdTitle(title);
     setActiveAdReward(reward);
+    setActiveAdMissionKey(missionKey);
     setAdModalOpen(true);
     setAdCountdown(5);
     setAdWatchFinished(false);
@@ -128,15 +168,38 @@ function Dashboard() {
     };
   }, [adModalOpen, adCountdown]);
 
-  // Claim Ad Reward
-  const claimAdReward = () => {
-    setBalanceSats((prev) => prev + activeAdReward);
-    const missionKey = activeAdTitle.toLowerCase().replace(/\s+/g, "-");
-    setCompletedMissions((prev) => [...prev, missionKey]);
+  // Claim Ad Reward (server-authoritative)
+  const claimAdReward = async () => {
+    if (!userId || !activeAdMissionKey) return;
+    const res = await miningAction({
+      userId,
+      action: "mission",
+      missionKey: activeAdMissionKey,
+    });
     setAdModalOpen(false);
-    
-    // Add custom toast indicator
-    setStreakMessage(`⚡ Mission Completed: +${activeAdReward} Sats added!`);
+    if (res.ok) {
+      applyState(res.state);
+      setStreakMessage(`⚡ Mission Completed: +${res.rewardSats} Sats added!`);
+    } else if (res.error) {
+      setStreakMessage(res.error);
+    }
+    setTimeout(() => setStreakMessage(""), 4000);
+  };
+
+  // Direct (non-video) mission claim — e.g. follow X community
+  const claimXFollowMission = async () => {
+    if (!userId || completedMissions.includes("follow-x-community")) return;
+    const res = await miningAction({
+      userId,
+      action: "mission",
+      missionKey: "follow-x-community",
+    });
+    if (res.ok) {
+      applyState(res.state);
+      setStreakMessage(`🐦 Twitter Bounty Added! +${res.rewardSats} Sats!`);
+    } else if (res.error) {
+      setStreakMessage(res.error);
+    }
     setTimeout(() => setStreakMessage(""), 4000);
   };
 
@@ -147,23 +210,32 @@ function Dashboard() {
     setSubscribingState("idle");
   };
 
-  const processMockPurchase = () => {
+  const processMockPurchase = async () => {
+    if (!userId || !subModalTier) return;
     setSubscribingState("authenticating");
-    setTimeout(() => {
+    // Keep the simulated FaceID/wallet-verification feel before the real call.
+    await new Promise((r) => setTimeout(r, 1200));
+    const res = await miningAction({
+      userId,
+      action: "upgrade",
+      tier: subModalTier,
+    });
+    if (res.ok) {
+      applyState(res.state);
       setSubscribingState("success");
       setTimeout(() => {
-        if (subModalTier) {
-          setActiveTier(subModalTier);
-        }
         setSubModalOpen(false);
-        setStreakMessage(`💎 Welcome to ${subModalTier?.toUpperCase()} Tier! Your mining engine is boosted.`);
+        setStreakMessage(`💎 Welcome to ${subModalTier.toUpperCase()} Tier! Your mining engine is boosted.`);
         setTimeout(() => setStreakMessage(""), 4000);
-      }, 1500);
-    }, 2000);
+      }, 1200);
+    } else {
+      setSubscribingState("idle");
+      setSubModalOpen(false);
+    }
   };
 
-  // Handle Withdrawal Request
-  const handleWithdrawal = (e: React.FormEvent) => {
+  // Handle Withdrawal Request (server-authoritative)
+  const handleWithdrawal = async (e: React.FormEvent) => {
     e.preventDefault();
     if (balanceSats < 10000) {
       setWithdrawError("Minimum withdrawal threshold is 10,000 Satoshis.");
@@ -177,19 +249,41 @@ function Dashboard() {
     setWithdrawError("");
     setIsWithdrawing(true);
 
-    setTimeout(() => {
-      const generatedTx = "tx-hh-" + Math.random().toString(16).substr(2, 9) + "f7931a";
-      setWithdrawalTxId(generatedTx);
-      setBalanceSats(0);
+    const res = await requestWithdrawal({
+      userId: userId ?? "anonymous",
+      address: withdrawAddress,
+    });
+    setIsWithdrawing(false);
+
+    if (res.ok) {
+      setWithdrawalTxId(res.txid);
       setWithdrawalSuccess(true);
-      setIsWithdrawing(false);
-    }, 2000);
+      if (res.state) applyState(res.state);
+    } else if (res.error) {
+      setWithdrawError(res.error);
+    }
   };
 
   const resetWithdrawalScreen = () => {
     setWithdrawAddress("");
     setWithdrawalSuccess(false);
     setWithdrawalTxId("");
+  };
+
+  // Toggle the mining engine on/off (server-authoritative rewards)
+  const toggleMining = async () => {
+    if (!userId) return;
+    if (isMining) {
+      const res = await miningAction({ userId, action: "claim" });
+      if (res.ok) {
+        applyState(res.state);
+        setStreakMessage(`⛏️ Harvester halted. Claimed +${res.rewardSats.toFixed(2)} Sats mined!`);
+        setTimeout(() => setStreakMessage(""), 4000);
+      }
+    } else {
+      const res = await miningAction({ userId, action: "start" });
+      if (res.ok) applyState(res.state);
+    }
   };
 
   return (
@@ -331,7 +425,7 @@ function Dashboard() {
                 <div>
                   <div className="text-[#BDBDBD] text-[9px] uppercase font-bold">EST. 24H PAYOUT</div>
                   <div className="text-white font-bold mt-1 text-sm">
-                    {isMining ? (activeHashrate * 172.8).toFixed(0) : "0"} Sats
+                    {isMining ? (serverState?.est24hPayoutSats ?? 0).toFixed(0) : "0"} Sats
                   </div>
                 </div>
                 <div>
@@ -347,7 +441,7 @@ function Dashboard() {
 
             {/* Giant Harvester Power Button */}
             <button
-              onClick={() => setIsMining(!isMining)}
+              onClick={toggleMining}
               className={`w-full py-5 rounded-2xl font-black uppercase text-base tracking-wider transition-all duration-300 transform active:scale-95 shadow-lg flex items-center justify-center gap-3 ${
                 isMining
                   ? "bg-[#27AE60] text-black hover:bg-[#2ecc71] shadow-[0_0_20px_rgba(39,174,96,0.3)]"
@@ -420,7 +514,7 @@ function Dashboard() {
                     : "bg-[#F7931A] text-black hover:bg-[#ffaa3a] shadow-md transform active:scale-95"
                 }`}
               >
-                {streakClaimed ? "✓ Multiplier Stacked (Come Back Tomorrow)" : "⚡ CLAIM DAY 3 STACKING BONUS (+150 Sats)"}
+                {streakClaimed ? "✓ Multiplier Stacked (Come Back Tomorrow)" : `⚡ CLAIM DAY ${streakDay} STACKING BONUS (+${streakDay * 50} Sats)`}
               </button>
             </div>
 
@@ -445,7 +539,7 @@ function Dashboard() {
                     </div>
                   </div>
                   <button
-                    onClick={() => startAdMission("video-ad", "Premium Sponsor Video Ad", 150)}
+                    onClick={() => startAdMission("premium-sponsor-video-ad", "Premium Sponsor Video Ad", 150)}
                     disabled={completedMissions.includes("premium-sponsor-video-ad")}
                     className={`py-2 px-4 rounded-xl text-xs font-bold transition-all ${
                       completedMissions.includes("premium-sponsor-video-ad")
@@ -472,7 +566,7 @@ function Dashboard() {
                     </div>
                   </div>
                   <button
-                    onClick={() => startAdMission("interstitial-ad", "Interactive Harvester Interstitial", 80)}
+                    onClick={() => startAdMission("interactive-harvester-interstitial", "Interactive Harvester Interstitial", 80)}
                     disabled={completedMissions.includes("interactive-harvester-interstitial")}
                     className={`py-2 px-4 rounded-xl text-xs font-bold transition-all ${
                       completedMissions.includes("interactive-harvester-interstitial")
@@ -499,12 +593,7 @@ function Dashboard() {
                     </div>
                   </div>
                   <button
-                    onClick={() => {
-                      setBalanceSats((prev) => prev + 200);
-                      setCompletedMissions((prev) => [...prev, "follow-x-community"]);
-                      setStreakMessage("🐦 Twitter Bounty Added! +200 Sats!");
-                      setTimeout(() => setStreakMessage(""), 4000);
-                    }}
+                    onClick={claimXFollowMission}
                     disabled={completedMissions.includes("follow-x-community")}
                     className={`py-2 px-4 rounded-xl text-xs font-bold transition-all ${
                       completedMissions.includes("follow-x-community")
