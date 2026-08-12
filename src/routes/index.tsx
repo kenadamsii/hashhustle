@@ -3,9 +3,9 @@ import { createServerFn } from "@tanstack/react-start";
 import { readFile } from "node:fs/promises";
 import { useState, useEffect, useMemo, useCallback } from "react";
 import logoUrl from "../logo.png";
-import { claimMining } from "./api/-mining";
-import { getBalance } from "./api/-balance";
-import { requestWithdrawal } from "./api/-withdraw";
+import { miningAction } from "./api/mining";
+import { getBalance } from "./api/balance";
+import { requestWithdrawal } from "./api/withdraw";
 
 // Read the business name at request time
 const getBusinessName = createServerFn({ method: "GET" }).handler(async () => {
@@ -181,21 +181,24 @@ function Dashboard() {
 
   // Handle Mining Toggle — calls backend API
   const handleMiningToggle = useCallback(async () => {
+    const userId = "demo_user_1"; // TODO: replace with real auth
     if (isMining) {
+      // Claim rewards and stop
+      try {
+        const result = await miningAction({ data: { userId, action: "claim" } });
+        setBalanceSats(result.ok ? result.state.balanceSats : balanceSats);
+      } catch { /* keep local state */ }
       setIsMining(false);
     } else {
+      // Start mining
       try {
-        const result = await claimMining();
-        setBalanceSats((prev) => prev + result.reward);
-        setIsMining(true);
-        setStreakMessage(`⛏️ +${result.reward} Sats mined! Hashrate: ${result.hashrate} TH/s`);
-        setTimeout(() => setStreakMessage(""), 4000);
-      } catch {
-        // Fallback: toggle locally if backend unreachable
-        setIsMining(true);
-      }
+        await miningAction({ data: { userId, action: "start" } });
+      } catch { /* continue locally */ }
+      setIsMining(true);
+      setStreakMessage("⛏️ Mining engine engaged!");
+      setTimeout(() => setStreakMessage(""), 4000);
     }
-  }, [isMining]);
+  }, [isMining, balanceSats]);
 
   // Handle Withdrawal — calls backend API
   const handleWithdrawal = useCallback(async (e: React.FormEvent) => {
