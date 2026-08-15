@@ -6,6 +6,31 @@ import logoUrl from "../logo.png";
 import { miningAction } from "./api/mining";
 import { getBalance } from "./api/balance";
 import { requestWithdrawal } from "./api/withdraw";
+import { verifyPurchase } from "./api/purchase";
+import {
+  SUBSCRIPTION_PRODUCTS,
+  getPlayProduct,
+  purchaseSubscription,
+  acknowledgePurchase,
+  isNativePlatform,
+} from "../lib/billing";
+
+// Stable per-device identity (survives reloads, used for all backend calls).
+const USER_ID_KEY = "hh_user_id";
+function getUserId(): string {
+  if (typeof window === "undefined") return "ssr-user";
+  let id = window.localStorage.getItem(USER_ID_KEY);
+  if (!id) {
+    id =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : "user-" +
+          Math.random().toString(36).slice(2) +
+          Date.now().toString(36);
+    window.localStorage.setItem(USER_ID_KEY, id);
+  }
+  return id;
+}
 
 // Read the business name at request time
 const getBusinessName = createServerFn({ method: "GET" }).handler(async () => {
@@ -28,6 +53,7 @@ function Dashboard() {
   const businessName = Route.useLoaderData();
 
   // Core App State
+  const [userId] = useState<string>(() => getUserId());
   const [balanceSats, setBalanceSats] = useState<number>(0);
   const [isMining, setIsMining] = useState<boolean>(false);
   const [activeTier, setActiveTier] = useState<"free" | "pro" | "whale">("free");
@@ -35,16 +61,18 @@ function Dashboard() {
 
   // Load initial balance from backend
   useEffect(() => {
-    getBalance().then((data) => {
-      setBalanceSats(data.sats);
-      setActiveTier(data.tier);
-      setLoading(false);
-    }).catch(() => {
-      // Fallback to defaults if backend unreachable
-      setBalanceSats(8420);
-      setLoading(false);
-    });
-  }, []);
+    getBalance({ data: { userId } })
+      .then((data) => {
+        setBalanceSats(data.balanceSats);
+        setActiveTier(data.tier);
+        setLoading(false);
+      })
+      .catch(() => {
+        // Fallback to defaults if backend unreachable
+        setBalanceSats(8420);
+        setLoading(false);
+      });
+  }, [userId]);
   
   // Streak State
   const [streakDay, setStreakDay] = useState<number>(3);
@@ -64,7 +92,11 @@ function Dashboard() {
   // Subscription Modal State
   const [subModalOpen, setSubModalOpen] = useState<boolean>(false);
   const [subModalTier, setSubModalTier] = useState<"pro" | "whale" | null>(null);
-  const [subscribingState, setSubscribingState] = useState<"idle" | "authenticating" | "success">("idle");
+  const [subscribingState, setSubscribingState] = useState<
+    "idle" | "purchasing" | "verifying" | "success" | "error"
+  >("idle");
+  const [purchaseError, setPurchaseError] = useState<string>("");
+  const [playProductPrice, setPlayProductPrice] = useState<string | null>(null);
 
   // Withdrawal State
   const [withdrawAddress, setWithdrawAddress] = useState<string>("");
@@ -157,31 +189,83 @@ function Dashboard() {
     setTimeout(() => setStreakMessage(""), 4000);
   };
 
-  // Handle Subscription Upgrades
-  const openUpgradeModal = (tier: "pro" | "whale") => {
+  // Handle Subscription Upgrades — real Play Billing on Android, a clearly
+  // labelled demo pipeline on web (no store exists there; the server-side
+  // verification + tier promotion path is identical either way).
+  const openUpgradeModal = async (tier: "pro" | "whale") => {
     setSubModalTier(tier);
     setSubModalOpen(true);
     setSubscribingState("idle");
+    setPurchaseError("");
+    setPlayProductPrice(null);
+    // On Android, confirm the product actually exists in Play Console and show
+    // the live store price in the modal.
+    if (isNativePlatform()) {
+      const product = await getPlayProduct(tier);
+      if (product?.price) setPlayProductPrice(product.price);
+    }
   };
 
-  const processMockPurchase = () => {
-    setSubscribingState("authenticating");
-    setTimeout(() => {
-      setSubscribingState("success");
-      setTimeout(() => {
-        if (subModalTier) {
-          setActiveTier(subModalTier);
-        }
-        setSubModalOpen(false);
-        setStreakMessage(`💎 Welcome to ${subModalTier?.toUpperCase()} Tier! Your mining engine is boosted.`);
-        setTimeout(() => setStreakMessage(""), 4000);
-      }, 1500);
-    }, 2000);
+  const processPurchase = async () => {
+    if (!subModalTier) return;
+    setSubscribingState("purchasing");
+    setPurchaseError("");
+    try {
+      let purchaseToken: string;
+      let source: "play" | "web-simulated";
+
+      if (isNativePlatform()) {
+        // Real Google Play Billing: launch the store purchase sheet, then ack
+        // (subscriptions must be acknowledged within 3 days or Google refunds).
+        const purchase = await purchaseSubscription(subModalTier);
+        purchaseToken = purchase.purchaseToken;
+        source = "play";
+        void acknowledgePurchase(purchaseToken);
+      } else {
+        // Web demo (no real charge — the modal says so). Uses the same server
+        // verification endpoint so the tier is promoted through the backend.
+        purchaseToken =
+          "web-simulated-" +
+          (typeof crypto !== "undefined" && "randomUUID" in crypto
+            ? crypto.randomUUID()
+            : Math.random().toString(36).slice(2));
+        source = "web-simulated";
+      }
+
+      setSubscribingState("verifying");
+      const productId = SUBSCRIPTION_PRODUCTS[subModalTier].productId;
+      const result = await verifyPurchase({
+        data: { userId, productId, purchaseToken, source },
+      });
+
+      if (result.ok) {
+        setActiveTier(result.state.tier);
+        setSubscribingState("success");
+        setTimeout(() => {
+          setSubModalOpen(false);
+          setSubscribingState("idle");
+          setStreakMessage(
+            `💎 Welcome to ${result.state.tier.toUpperCase()} Tier! Your mining engine is boosted.`,
+          );
+          setTimeout(() => setStreakMessage(""), 4000);
+        }, 1500);
+      } else {
+        setPurchaseError(result.error || "Purchase verification failed.");
+        setSubscribingState("error");
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Purchase failed";
+      setPurchaseError(
+        msg.toLowerCase().includes("canceled")
+          ? "Purchase was canceled."
+          : `Purchase failed: ${msg}`,
+      );
+      setSubscribingState("error");
+    }
   };
 
   // Handle Mining Toggle — calls backend API
   const handleMiningToggle = useCallback(async () => {
-    const userId = "demo_user_1"; // TODO: replace with real auth
     if (isMining) {
       // Claim rewards and stop
       try {
@@ -198,7 +282,7 @@ function Dashboard() {
       setStreakMessage("⛏️ Mining engine engaged!");
       setTimeout(() => setStreakMessage(""), 4000);
     }
-  }, [isMining, balanceSats]);
+  }, [isMining, balanceSats, userId]);
 
   // Handle Withdrawal — calls backend API
   const handleWithdrawal = useCallback(async (e: React.FormEvent) => {
@@ -217,11 +301,11 @@ function Dashboard() {
 
     try {
       const result = await requestWithdrawal({
-        data: { address: withdrawAddress, amount: balanceSats },
+        data: { userId, address: withdrawAddress },
       });
 
-      if (result.success) {
-        setWithdrawalTxId(result.txId);
+      if (result.ok) {
+        setWithdrawalTxId(result.txid);
         setBalanceSats(0);
         setWithdrawalSuccess(true);
       } else {
@@ -232,7 +316,7 @@ function Dashboard() {
     } finally {
       setIsWithdrawing(false);
     }
-  }, [balanceSats, withdrawAddress]);
+  }, [balanceSats, withdrawAddress, userId]);
 
   const resetWithdrawalScreen = () => {
     setWithdrawAddress("");
@@ -867,18 +951,40 @@ function Dashboard() {
               </div>
               <div className="flex justify-between pt-1 font-bold text-sm">
                 <span className="text-white">Price:</span>
-                <span className="text-white">{subModalTier === "whale" ? "$29.99" : "$9.99"} / Month</span>
+                <span className="text-white">{playProductPrice ?? (subModalTier === "whale" ? "$29.99" : "$9.99")} / Month</span>
               </div>
             </div>
 
             {subscribingState === "idle" && (
               <div className="space-y-3">
-                <button
-                  onClick={processMockPurchase}
-                  className="w-full py-4 rounded-xl bg-[#F7931A] text-black font-black uppercase text-xs tracking-wider hover:bg-[#ffaa3a] transition-all transform active:scale-95 shadow-lg"
-                >
-                  Pay with Simulated Wallet
-                </button>
+                {isNativePlatform() ? (
+                  <>
+                    <button
+                      onClick={processPurchase}
+                      className="w-full py-4 rounded-xl bg-[#F7931A] text-black font-black uppercase text-xs tracking-wider hover:bg-[#ffaa3a] transition-all transform active:scale-95 shadow-lg"
+                    >
+                      Subscribe via Google Play
+                    </button>
+                    <p className="text-[10px] text-[#BDBDBD]">
+                      You'll be redirected to the Google Play purchase screen to
+                      confirm with your Play Store account.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      onClick={processPurchase}
+                      className="w-full py-4 rounded-xl bg-[#F7931A] text-black font-black uppercase text-xs tracking-wider hover:bg-[#ffaa3a] transition-all transform active:scale-95 shadow-lg"
+                    >
+                      Demo Upgrade (no charge)
+                    </button>
+                    <p className="text-[10px] text-[#BDBDBD]">
+                      Play Billing runs inside the HashHustle Android app. On the
+                      web demo this completes a simulated purchase — no real
+                      charge — through the same verification pipeline.
+                    </p>
+                  </>
+                )}
                 <button
                   onClick={() => setSubModalOpen(false)}
                   className="w-full py-3 rounded-xl bg-transparent border border-[#2D2D2D] text-[#BDBDBD] font-bold text-xs hover:text-white transition-all"
@@ -888,10 +994,14 @@ function Dashboard() {
               </div>
             )}
 
-            {subscribingState === "authenticating" && (
+            {(subscribingState === "purchasing" || subscribingState === "verifying") && (
               <div className="py-6 flex flex-col items-center justify-center">
                 <div className="w-10 h-10 border-4 border-[#F7931A]/20 border-t-[#F7931A] rounded-full animate-spin mb-4"></div>
-                <div className="text-xs font-bold text-white uppercase tracking-wider">Simulating FaceID / Wallet Verification...</div>
+                <div className="text-xs font-bold text-white uppercase tracking-wider">
+                  {subscribingState === "purchasing"
+                    ? "Opening Google Play purchase screen..."
+                    : "Verifying purchase with HashHustle..."}
+                </div>
               </div>
             )}
 
@@ -900,7 +1010,27 @@ function Dashboard() {
                 <div className="w-12 h-12 bg-[#27AE60]/10 border-2 border-[#27AE60] rounded-full flex items-center justify-center text-xl font-bold mb-4">
                   ✓
                 </div>
-                <div className="text-xs font-black uppercase tracking-wider">Purchase Authenticated Successfully!</div>
+                <div className="text-xs font-black uppercase tracking-wider">Subscription Activated!</div>
+              </div>
+            )}
+
+            {subscribingState === "error" && (
+              <div className="space-y-3">
+                <div className="bg-[#EB5757]/10 border border-[#EB5757]/40 text-[#EB5757] p-3 rounded-xl text-xs font-semibold">
+                  ⚠ {purchaseError}
+                </div>
+                <button
+                  onClick={() => setSubscribingState("idle")}
+                  className="w-full py-3.5 rounded-xl bg-[#F7931A] text-black font-black uppercase text-xs tracking-wider hover:bg-[#ffaa3a] transition-all"
+                >
+                  Try Again
+                </button>
+                <button
+                  onClick={() => setSubModalOpen(false)}
+                  className="w-full py-3 rounded-xl bg-transparent border border-[#2D2D2D] text-[#BDBDBD] font-bold text-xs hover:text-white transition-all"
+                >
+                  Close
+                </button>
               </div>
             )}
 
