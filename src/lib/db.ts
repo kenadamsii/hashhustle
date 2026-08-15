@@ -42,6 +42,18 @@ export interface WithdrawalRow {
   created_at: number;
 }
 
+export interface PurchaseRow {
+  id: string;
+  user_id: string;
+  product_id: string;
+  tier: "pro" | "whale";
+  source: "play" | "web-simulated";
+  status: "pending-verification" | "simulated" | "verified";
+  purchase_token: string;
+  price_usd: number;
+  created_at: number;
+}
+
 export function getDb(): Database {
   if (db) return db;
   const path = process.env.HH_DB_PATH ?? "./data/hashhustle.db";
@@ -94,6 +106,18 @@ function migrate(d: Database) {
       reward_sats REAL NOT NULL,
       claimed_at INTEGER NOT NULL,
       PRIMARY KEY (user_id, mission_key, claim_date)
+    );
+
+    CREATE TABLE IF NOT EXISTS purchases (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id),
+      product_id TEXT NOT NULL,
+      tier TEXT NOT NULL,
+      source TEXT NOT NULL,
+      status TEXT NOT NULL,
+      purchase_token TEXT NOT NULL UNIQUE,
+      price_usd REAL NOT NULL,
+      created_at INTEGER NOT NULL
     );
   `);
 }
@@ -214,4 +238,37 @@ export function insertMissionClaim(
       "INSERT OR IGNORE INTO mission_claims (user_id, mission_key, claim_date, reward_sats, claimed_at) VALUES (?, ?, ?, ?, ?)",
     )
     .run(userId, missionKey, date, rewardSats, Date.now());
+}
+
+export function insertPurchase(p: PurchaseRow) {
+  getDb()
+    .query(
+      "INSERT OR IGNORE INTO purchases (id, user_id, product_id, tier, source, status, purchase_token, price_usd, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .run(
+      p.id,
+      p.user_id,
+      p.product_id,
+      p.tier,
+      p.source,
+      p.status,
+      p.purchase_token,
+      p.price_usd,
+      p.created_at,
+    );
+}
+
+/** Look up a purchase by its (unique) token — used to keep verify idempotent. */
+export function getPurchaseByToken(
+  purchaseToken: string,
+): PurchaseRow | null {
+  return getDb()
+    .query("SELECT * FROM purchases WHERE purchase_token = ?")
+    .get(purchaseToken) as PurchaseRow | null;
+}
+
+export function getPurchasesByUser(userId: string): PurchaseRow[] {
+  return getDb()
+    .query("SELECT * FROM purchases WHERE user_id = ? ORDER BY created_at DESC")
+    .all(userId) as PurchaseRow[];
 }
